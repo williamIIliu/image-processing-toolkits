@@ -43,7 +43,7 @@
 在使用图片处理服务器之前，需要安装以下依赖包：
 
 ```bash
-pip install Pillow opencv-python numpy psutil mcp
+pip install Pillow opencv-python numpy psutil mcp[cli]
 ```
 
 或者使用项目的配置文件：
@@ -51,6 +51,8 @@ pip install Pillow opencv-python numpy psutil mcp
 ```bash
 pip install -r requirements.txt
 ```
+
+**注意**: 必须安装 `mcp[cli]` 而不是单独的 `mcp`，这样才能包含所需的 CLI 工具和依赖（如 typer）。
 
 ### 2. MCP Server 配置
 
@@ -109,6 +111,14 @@ pip install -r requirements.txt
     }
 }
 ```
+
+#### FastMCP 特性
+本服务器使用 **FastMCP** 框架构建，提供以下优势：
+- **简化的工具定义**: 使用 `@mcp.tool()` 装饰器直接定义工具
+- **自动类型推断**: 从函数签名自动生成工具模式
+- **更少的样板代码**: 无需手动定义复杂的工具列表和处理器
+- **更好的开发体验**: 专注于业务逻辑而非协议细节
+- **自动文档生成**: 从函数docstring自动生成工具描述
 
 ### 3. 启动服务器
 

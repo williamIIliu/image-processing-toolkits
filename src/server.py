@@ -15,25 +15,14 @@ The server uses PIL (Pillow) for image processing and includes memory management
 and caching for efficient operation.
 """
 
-from typing import Any, List, Dict, Tuple, Optional
-import asyncio
-import base64
-import io
+from typing import Any, Dict, Optional
 import os
 import threading
 import time
 import psutil
-import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
 from PIL.ExifTags import TAGS
-import cv2
-from functools import lru_cache
-import concurrent.futures
-from collections import defaultdict
-import mcp.types as types
-from mcp.server.models import InitializationOptions
-from mcp.server import NotificationOptions, Server
-import mcp.server.stdio
+from mcp.server.fastmcp import FastMCP
 
 class ImageProcessorError(Exception):
     """Base class for image processing related errors"""
@@ -138,335 +127,11 @@ class ImageManager:
 # Create global ImageManager instance
 image_manager = ImageManager()
 
-# Server initialization
-server = Server("image_processing_toolkits")
+# Create FastMCP server
+mcp = FastMCP("Image Processing Toolkits")
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    """List available image processing tools"""
-    return [
-        types.Tool(
-            name="crop-image",
-            description="Crop image to specified region",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "x": {
-                        "type": "integer",
-                        "description": "X coordinate of the top-left corner of crop region",
-                    },
-                    "y": {
-                        "type": "integer",
-                        "description": "Y coordinate of the top-left corner of crop region",
-                    },
-                    "width": {
-                        "type": "integer",
-                        "description": "Width of the crop region",
-                    },
-                    "height": {
-                        "type": "integer",
-                        "description": "Height of the crop region",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "x", "y", "width", "height"],
-            },
-        ),
-        types.Tool(
-            name="rotate-image",
-            description="Rotate image by specified angle",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "angle": {
-                        "type": "number",
-                        "description": "Rotation angle in degrees",
-                    },
-                    "expand": {
-                        "type": "boolean",
-                        "description": "Whether to expand canvas to fit rotated image",
-                        "default": True,
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "angle"],
-            },
-        ),
-        types.Tool(
-            name="resize-image",
-            description="Resize image to specified dimensions",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "width": {
-                        "type": "integer",
-                        "description": "New width",
-                    },
-                    "height": {
-                        "type": "integer",
-                        "description": "New height",
-                    },
-                    "maintain_aspect": {
-                        "type": "boolean",
-                        "description": "Whether to maintain aspect ratio",
-                        "default": True,
-                    },
-                    "resample": {
-                        "type": "string",
-                        "description": "Resampling method",
-                        "enum": ["LANCZOS", "BILINEAR", "BICUBIC", "NEAREST"],
-                        "default": "LANCZOS",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "width", "height"],
-            },
-        ),
-        types.Tool(
-            name="adjust-contrast",
-            description="Adjust image contrast",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "Contrast adjustment factor (1.0 = original, >1 = enhance, <1 = reduce)",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "factor"],
-            },
-        ),
-        types.Tool(
-            name="adjust-brightness",
-            description="Adjust image brightness",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "Brightness adjustment factor (1.0 = original, >1 = brighter, <1 = darker)",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "factor"],
-            },
-        ),
-        types.Tool(
-            name="adjust-saturation",
-            description="Adjust image saturation",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "factor": {
-                        "type": "number",
-                        "description": "Saturation adjustment factor (1.0 = original, >1 = enhance, <1 = reduce, 0 = grayscale)",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "factor"],
-            },
-        ),
-        types.Tool(
-            name="apply-filter",
-            description="Apply image filter",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "filter_type": {
-                        "type": "string",
-                        "description": "Filter type",
-                        "enum": ["BLUR", "DETAIL", "EDGE_ENHANCE", "EDGE_ENHANCE_MORE", 
-                                "EMBOSS", "FIND_EDGES", "SHARPEN", "SMOOTH", "SMOOTH_MORE"],
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "filter_type"],
-            },
-        ),
-        types.Tool(
-            name="flip-image",
-            description="Flip image horizontally or vertically",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "direction": {
-                        "type": "string",
-                        "description": "Flip direction",
-                        "enum": ["horizontal", "vertical"],
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "direction"],
-            },
-        ),
-        types.Tool(
-            name="convert-format",
-            description="Convert image format",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "format": {
-                        "type": "string",
-                        "description": "Target format",
-                        "enum": ["JPEG", "PNG", "BMP", "TIFF", "WEBP"],
-                    },
-                    "quality": {
-                        "type": "integer",
-                        "description": "JPEG quality (1-100)",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "default": 95,
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "format"],
-            },
-        ),
-        types.Tool(
-            name="get-image-info",
-            description="Get image information and metadata",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                },
-                "required": ["file_path"],
-            },
-        ),
-        types.Tool(
-            name="create-thumbnail",
-            description="Create image thumbnail",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "size": {
-                        "type": "integer",
-                        "description": "Maximum thumbnail size",
-                        "default": 128,
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path"],
-            },
-        ),
-        types.Tool(
-            name="add-watermark",
-            description="Add watermark to image",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the image file",
-                    },
-                    "watermark_text": {
-                        "type": "string",
-                        "description": "Watermark text",
-                    },
-                    "position": {
-                        "type": "string",
-                        "description": "Watermark position",
-                        "enum": ["top-left", "top-right", "bottom-left", "bottom-right", "center"],
-                        "default": "bottom-right",
-                    },
-                    "opacity": {
-                        "type": "number",
-                        "description": "Watermark opacity (0.0-1.0)",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "default": 0.5,
-                    },
-                    "font_size": {
-                        "type": "integer",
-                        "description": "Font size",
-                        "default": 36,
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Output file path (optional)",
-                    },
-                },
-                "required": ["file_path", "watermark_text"],
-            },
-        ),
-    ]
-
-# Image processing functions
-async def crop_image(file_path: str, x: int, y: int, width: int, height: int, output_path: str = None) -> str:
+@mcp.tool()
+def crop_image(file_path: str, x: int, y: int, width: int, height: int, output_path: Optional[str] = None) -> str:
     """Crop image to specified region"""
     try:
         image = image_manager.load_image(file_path)
@@ -490,7 +155,8 @@ async def crop_image(file_path: str, x: int, y: int, width: int, height: int, ou
     except Exception as e:
         raise ImageProcessingError(f"Error cropping image: {str(e)}")
 
-async def rotate_image(file_path: str, angle: float, expand: bool = True, output_path: str = None) -> str:
+@mcp.tool()
+def rotate_image(file_path: str, angle: float, expand: bool = True, output_path: Optional[str] = None) -> str:
     """Rotate image by specified angle"""
     try:
         image = image_manager.load_image(file_path)
@@ -509,8 +175,9 @@ async def rotate_image(file_path: str, angle: float, expand: bool = True, output
     except Exception as e:
         raise ImageProcessingError(f"Error rotating image: {str(e)}")
 
-async def resize_image(file_path: str, width: int, height: int, maintain_aspect: bool = True, 
-                      resample: str = "LANCZOS", output_path: str = None) -> str:
+@mcp.tool()
+def resize_image(file_path: str, width: int, height: int, maintain_aspect: bool = True, 
+                resample: str = "LANCZOS", output_path: Optional[str] = None) -> str:
     """Resize image to specified dimensions"""
     try:
         image = image_manager.load_image(file_path)
@@ -543,8 +210,9 @@ async def resize_image(file_path: str, width: int, height: int, maintain_aspect:
     except Exception as e:
         raise ImageProcessingError(f"Error resizing image: {str(e)}")
 
-async def adjust_contrast(file_path: str, factor: float, output_path: str = None) -> str:
-    """Adjust image contrast"""
+@mcp.tool()
+def adjust_contrast(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
+    """Adjust image contrast (1.0 = original, >1 = enhance, <1 = reduce)"""
     try:
         image = image_manager.load_image(file_path)
         
@@ -563,8 +231,9 @@ async def adjust_contrast(file_path: str, factor: float, output_path: str = None
     except Exception as e:
         raise ImageProcessingError(f"Error adjusting contrast: {str(e)}")
 
-async def adjust_brightness(file_path: str, factor: float, output_path: str = None) -> str:
-    """Adjust image brightness"""
+@mcp.tool()
+def adjust_brightness(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
+    """Adjust image brightness (1.0 = original, >1 = brighter, <1 = darker)"""
     try:
         image = image_manager.load_image(file_path)
         
@@ -583,8 +252,9 @@ async def adjust_brightness(file_path: str, factor: float, output_path: str = No
     except Exception as e:
         raise ImageProcessingError(f"Error adjusting brightness: {str(e)}")
 
-async def adjust_saturation(file_path: str, factor: float, output_path: str = None) -> str:
-    """Adjust image saturation"""
+@mcp.tool()
+def adjust_saturation(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
+    """Adjust image saturation (1.0 = original, >1 = enhance, <1 = reduce, 0 = grayscale)"""
     try:
         image = image_manager.load_image(file_path)
         
@@ -603,8 +273,9 @@ async def adjust_saturation(file_path: str, factor: float, output_path: str = No
     except Exception as e:
         raise ImageProcessingError(f"Error adjusting saturation: {str(e)}")
 
-async def apply_filter(file_path: str, filter_type: str, output_path: str = None) -> str:
-    """Apply image filter"""
+@mcp.tool()
+def apply_filter(file_path: str, filter_type: str, output_path: Optional[str] = None) -> str:
+    """Apply image filter (BLUR, DETAIL, EDGE_ENHANCE, EDGE_ENHANCE_MORE, EMBOSS, FIND_EDGES, SHARPEN, SMOOTH, SMOOTH_MORE)"""
     try:
         image = image_manager.load_image(file_path)
         
@@ -639,7 +310,8 @@ async def apply_filter(file_path: str, filter_type: str, output_path: str = None
     except Exception as e:
         raise ImageProcessingError(f"Error applying filter: {str(e)}")
 
-async def flip_image(file_path: str, direction: str, output_path: str = None) -> str:
+@mcp.tool()
+def flip_image(file_path: str, direction: str, output_path: Optional[str] = None) -> str:
     """Flip image horizontally or vertically"""
     try:
         image = image_manager.load_image(file_path)
@@ -663,8 +335,9 @@ async def flip_image(file_path: str, direction: str, output_path: str = None) ->
     except Exception as e:
         raise ImageProcessingError(f"Error flipping image: {str(e)}")
 
-async def convert_format(file_path: str, format: str, quality: int = 95, output_path: str = None) -> str:
-    """Convert image format"""
+@mcp.tool()
+def convert_format(file_path: str, format: str, quality: int = 95, output_path: Optional[str] = None) -> str:
+    """Convert image format (JPEG, PNG, BMP, TIFF, WEBP)"""
     try:
         image = image_manager.load_image(file_path)
         
@@ -688,7 +361,8 @@ async def convert_format(file_path: str, format: str, quality: int = 95, output_
     except Exception as e:
         raise ImageProcessingError(f"Error converting format: {str(e)}")
 
-async def get_image_info(file_path: str) -> Dict[str, Any]:
+@mcp.tool()
+def get_image_info(file_path: str) -> str:
     """Get image information and metadata"""
     try:
         image = image_manager.load_image(file_path)
@@ -716,12 +390,23 @@ async def get_image_info(file_path: str) -> Dict[str, Any]:
                 exif_data[tag] = value
             info["EXIF Data"] = exif_data
         
-        return info
+        # Format output
+        text = "Image Information:\n"
+        for key, value in info.items():
+            if key == "EXIF Data" and isinstance(value, dict):
+                text += f"\n{key}:\n"
+                for exif_key, exif_value in value.items():
+                    text += f"  {exif_key}: {exif_value}\n"
+            else:
+                text += f"{key}: {value}\n"
+        
+        return text
         
     except Exception as e:
-        return {"Error": f"Error getting image info: {str(e)}"}
+        return f"Error getting image info: {str(e)}"
 
-async def create_thumbnail(file_path: str, size: int = 128, output_path: str = None) -> str:
+@mcp.tool()
+def create_thumbnail(file_path: str, size: int = 128, output_path: Optional[str] = None) -> str:
     """Create image thumbnail"""
     try:
         image = image_manager.load_image(file_path)
@@ -740,8 +425,9 @@ async def create_thumbnail(file_path: str, size: int = 128, output_path: str = N
     except Exception as e:
         raise ImageProcessingError(f"Error creating thumbnail: {str(e)}")
 
-async def add_watermark(file_path: str, watermark_text: str, position: str = "bottom-right", 
-                       opacity: float = 0.5, font_size: int = 36, output_path: str = None) -> str:
+@mcp.tool()
+def add_watermark(file_path: str, watermark_text: str, position: str = "bottom-right", 
+                 opacity: float = 0.5, font_size: int = 36, output_path: Optional[str] = None) -> str:
     """Add watermark to image"""
     try:
         image = image_manager.load_image(file_path)
@@ -798,141 +484,5 @@ async def add_watermark(file_path: str, watermark_text: str, position: str = "bo
     except Exception as e:
         raise ImageProcessingError(f"Error adding watermark: {str(e)}")
 
-@server.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict | None
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    """Handle tool call requests"""
-    if not arguments:
-        raise ValueError("Missing arguments")
-
-    file_path = arguments.get("file_path")
-    if not file_path:
-        raise ValueError("Missing file path")
-
-    try:
-        if name == "crop-image":
-            x = arguments.get("x")
-            y = arguments.get("y")
-            width = arguments.get("width")
-            height = arguments.get("height")
-            output_path = arguments.get("output_path")
-            result = await crop_image(file_path, x, y, width, height, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "rotate-image":
-            angle = arguments.get("angle")
-            expand = arguments.get("expand", True)
-            output_path = arguments.get("output_path")
-            result = await rotate_image(file_path, angle, expand, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "resize-image":
-            width = arguments.get("width")
-            height = arguments.get("height")
-            maintain_aspect = arguments.get("maintain_aspect", True)
-            resample = arguments.get("resample", "LANCZOS")
-            output_path = arguments.get("output_path")
-            result = await resize_image(file_path, width, height, maintain_aspect, resample, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "adjust-contrast":
-            factor = arguments.get("factor")
-            output_path = arguments.get("output_path")
-            result = await adjust_contrast(file_path, factor, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "adjust-brightness":
-            factor = arguments.get("factor")
-            output_path = arguments.get("output_path")
-            result = await adjust_brightness(file_path, factor, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "adjust-saturation":
-            factor = arguments.get("factor")
-            output_path = arguments.get("output_path")
-            result = await adjust_saturation(file_path, factor, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "apply-filter":
-            filter_type = arguments.get("filter_type")
-            output_path = arguments.get("output_path")
-            result = await apply_filter(file_path, filter_type, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "flip-image":
-            direction = arguments.get("direction")
-            output_path = arguments.get("output_path")
-            result = await flip_image(file_path, direction, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "convert-format":
-            format = arguments.get("format")
-            quality = arguments.get("quality", 95)
-            output_path = arguments.get("output_path")
-            result = await convert_format(file_path, format, quality, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "get-image-info":
-            info = await get_image_info(file_path)
-            if "Error" in info:
-                return [types.TextContent(type="text", text=info["Error"])]
-            
-            text = "Image Information:\n"
-            for key, value in info.items():
-                if key == "EXIF Data" and isinstance(value, dict):
-                    text += f"\n{key}:\n"
-                    for exif_key, exif_value in value.items():
-                        text += f"  {exif_key}: {exif_value}\n"
-                else:
-                    text += f"{key}: {value}\n"
-            
-            return [types.TextContent(type="text", text=text)]
-        
-        elif name == "create-thumbnail":
-            size = arguments.get("size", 128)
-            output_path = arguments.get("output_path")
-            result = await create_thumbnail(file_path, size, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        elif name == "add-watermark":
-            watermark_text = arguments.get("watermark_text")
-            position = arguments.get("position", "bottom-right")
-            opacity = arguments.get("opacity", 0.5)
-            font_size = arguments.get("font_size", 36)
-            output_path = arguments.get("output_path")
-            result = await add_watermark(file_path, watermark_text, position, opacity, font_size, output_path)
-            return [types.TextContent(type="text", text=result)]
-        
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-    
-    except ImageProcessorError as e:
-        return [types.TextContent(type="text", text=f"Image processing error: {str(e)}")]
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Error processing request: {str(e)}")]
-
-async def main():
-    """Run the server"""
-    try:
-        print("Image Processing MCP Server starting...")
-        
-        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="image_processing_toolkits",
-                    server_version="0.1.0",
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
-                    ),
-                ),
-            )
-    except Exception as e:
-        print(f"Server runtime error: {str(e)}")
-        raise
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run()
