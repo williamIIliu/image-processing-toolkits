@@ -36,7 +36,9 @@
 - **并发处理** - 支持多线程并发处理
 - **错误处理** - 完善的错误处理和恢复机制
 
-## 安装依赖
+## 安装和配置
+
+### 1. 安装依赖
 
 在使用图片处理服务器之前，需要安装以下依赖包：
 
@@ -49,6 +51,85 @@ pip install Pillow opencv-python numpy psutil mcp
 ```bash
 pip install -r requirements.txt
 ```
+
+### 2. MCP Server 配置
+
+要在支持MCP的应用程序中使用此图像处理服务器，请将以下配置添加到您的MCP配置文件中：
+
+#### Claude Desktop 配置
+在 `%APPDATA%\Claude\claude_desktop_config.json` (Windows) 或 `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) 中添加：
+
+```json
+{
+    "mcpServers": {
+        "image_processing_toolkits": {
+            "command": "python",
+            "args": [
+                "e:/MyProjects/TOBench/server_tools/local_servers/image-processing-toolkits/src/server.py"
+            ],
+            "cwd": "e:/MyProjects/TOBench/server_tools/local_servers/image-processing-toolkits"
+        }
+    }
+}
+```
+
+#### 使用 uv 运行器的配置
+如果您使用 uv 作为 Python 包管理器：
+
+```json
+{
+    "mcpServers": {
+        "image_processing_toolkits": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "e:/MyProjects/TOBench/server_tools/local_servers/image-processing-toolkits",
+                "run",
+                "python",
+                "src/server.py"
+            ]
+        }
+    }
+}
+```
+
+#### 通用配置模板
+请将路径替换为您的实际安装路径：
+
+```json
+{
+    "mcpServers": {
+        "image_processing_toolkits": {
+            "command": "python",
+            "args": [
+                "/path/to/image-processing-toolkits/src/server.py"
+            ],
+            "cwd": "/path/to/image-processing-toolkits"
+        }
+    }
+}
+```
+
+### 3. 启动服务器
+
+#### 直接启动
+```bash
+python src/server.py
+```
+
+#### 使用 uv 启动
+```bash
+uv run python src/server.py
+```
+
+### 4. 验证安装
+
+启动服务器后，您应该看到以下消息：
+```
+Image Processing MCP Server starting...
+```
+
+如果配置正确，MCP客户端将能够发现并使用所有12个图像处理工具。
 
 ## 可用工具
 
@@ -173,18 +254,24 @@ pip install -r requirements.txt
 
 ### 启动服务器
 ```bash
-python tools/image_processor.py
+python src/server.py
 ```
 
-### 测试功能
+### 使用 uv 启动
 ```bash
-python test_image_processor.py
+uv run python src/server.py
 ```
 
-### 简单测试
-```bash
-python simple_test.py
-```
+### 在MCP客户端中使用
+配置完成后，您可以在支持MCP的应用程序（如Claude Desktop）中直接使用图像处理功能：
+
+1. **裁剪图片**: 使用 `crop-image` 工具精确裁剪图片区域
+2. **调整大小**: 使用 `resize-image` 工具智能缩放图片
+3. **应用滤镜**: 使用 `apply-filter` 工具为图片添加各种视觉效果
+4. **格式转换**: 使用 `convert-format` 工具在不同图片格式间转换
+5. **添加水印**: 使用 `add-watermark` 工具为图片添加文字水印
+
+所有工具都支持自动生成输出文件名，或者您可以指定自定义的输出路径。
 
 ## 技术特性
 
@@ -208,16 +295,13 @@ python simple_test.py
 ## 文件结构
 
 ```
-tools/
-├── image_processor.py      # 主服务器文件
-├── weather.py             # 天气服务器
-├── demo.py               # 演示文件
-└── server.py             # 其他服务器
-
-test_image_processor.py    # 完整功能测试
-simple_test.py            # 简单导入测试
-pyproject.toml            # 项目配置
-README_image_processor.md  # 本文档
+image-processing-toolkits/
+├── src/
+│   └── server.py          # 主MCP服务器文件
+├── LICENSE                # 许可证文件
+├── pyproject.toml         # 项目配置和依赖
+├── requirements.txt       # Python依赖列表
+└── README.md             # 项目文档（本文档）
 ```
 
 ## 注意事项
