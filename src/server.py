@@ -139,7 +139,7 @@ class ImageManager:
 image_manager = ImageManager()
 
 # Server initialization
-server = Server("image_processor")
+server = Server("image_processing_toolkits")
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -922,7 +922,7 @@ async def main():
                 read_stream,
                 write_stream,
                 InitializationOptions(
-                    server_name="image_processor",
+                    server_name="image_processing_toolkits",
                     server_version="0.1.0",
                     capabilities=server.get_capabilities(
                         notification_options=NotificationOptions(),
