@@ -2,27 +2,56 @@
 """
 Image Processing MCP Server
 
-This server provides comprehensive image processing capabilities including:
-- Basic operations: crop, rotate, resize, flip
+This server provides comprehensive media processing capabilities including:
+- Basic image operations: crop, rotate, resize, flip
 - Color adjustments: brightness, contrast, saturation
 - Filters and effects
 - Format conversion
 - Metadata extraction
 - Thumbnail generation
 - Watermark addition
+- file2image utilities: convert WORD and PPTX to images
+- Video utilities: metadata inspection, per-second frame sampling, per-second burst capture,
+  single-second snapshots, and frame-by-index exports
 
 The server uses PIL (Pillow) for image processing and includes memory management
 and caching for efficient operation.
 """
-
-from typing import Any, Dict, Optional
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Union
 import os
+import subprocess
 import threading
 import time
 import psutil
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
 from PIL.ExifTags import TAGS
 from mcp.server.fastmcp import FastMCP
+from pptxtoimages.tools import PPTXToImageConverter
+from pdf2image import convert_from_path
+import fitz 
+import io
+
+
+import json
+import math
+from pathlib import Path
+import imageio
+from moviepy.video.io.VideoFileClip import VideoFileClip
+
+
+def _ensure_video_path(video_path: str) -> Path:
+    """Validate the incoming video path and return it as a Path object."""
+    path = Path(video_path)
+    if not path.exists():
+        raise ImageProcessingError(f"Video not found at: {video_path}")
+    return path
+
+
+def _save_frame_to_path(frame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(output_path, frame)
+
 
 class ImageProcessorError(Exception):
     """Base class for image processing related errors"""
@@ -128,21 +157,50 @@ class ImageManager:
 image_manager = ImageManager()
 
 # Create FastMCP server
-mcp = FastMCP("Image Processing Toolkits")
+mcp = FastMCP("Image-Processing-Toolkits")
 
 @mcp.tool()
-def crop_image(file_path: str, x: int, y: int, width: int, height: int, output_path: Optional[str] = None) -> str:
-    """Crop image to specified region"""
+def crop_image(file_path: str, ymin: int, xmin: int, ymax: int, xmax: int, output_path: Optional[str] = None) -> str:
+    """Crop the image to a specified rectangular region defined by normalized bounding box coordinates (0-1000).
+    
+    This tool is designed to work directly with Vision Language Model outputs which typically provide
+    coordinates in [ymin, xmin, ymax, xmax] format on a 0-1000 scale.
+
+    Args:
+        file_path: Path to the source image file.
+        ymin: Top edge normalized coordinate (0-1000).
+        xmin: Left edge normalized coordinate (0-1000).
+        ymax: Bottom edge normalized coordinate (0-1000).
+        xmax: Right edge normalized coordinate (0-1000).
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_cropped<ext>" will be created next to
+            the source image.
+
+    Returns:
+        A human-readable message describing where the cropped image is saved,
+        or an error message if the requested region exceeds image boundaries.
+    """
     try:
         image = image_manager.load_image(file_path)
+        img_width, img_height = image.size
+
+        # Convert normalized coordinates (0-1000) to absolute pixels
+        # Formula: pixel = (normalized / 1000) * dimension
+        x0 = int((xmin / 1000) * img_width)
+        y0 = int((ymin / 1000) * img_height)
+        x1 = int((xmax / 1000) * img_width)
+        y1 = int((ymax / 1000) * img_height)
+        
+        # Ensure correct coordinates order
+        x_min, x_max = min(x0, x1), max(x0, x1)
+        y_min, y_max = min(y0, y1), max(y0, y1)
         
         # Validate crop region
-        img_width, img_height = image.size
-        if x < 0 or y < 0 or x + width > img_width or y + height > img_height:
-            return f"Crop region exceeds image boundaries. Image size: {img_width}x{img_height}"
+        if x_min < 0 or y_min < 0 or x_max > img_width or y_max > img_height:
+            return f"Crop region exceeds image boundaries. Image size: {img_width}x{img_height}, Crop: [{x_min}, {y_min}, {x_max}, {y_max}]"
         
         # Crop image
-        cropped = image.crop((x, y, x + width, y + height))
+        cropped = image.crop((x_min, y_min, x_max, y_max))
         
         # Save result
         if not output_path:
@@ -154,10 +212,78 @@ def crop_image(file_path: str, x: int, y: int, width: int, height: int, output_p
         
     except Exception as e:
         raise ImageProcessingError(f"Error cropping image: {str(e)}")
+        
+@mcp.tool()
+def apply_mosaic(file_path: str, x0: int, y0: int, x1: int, y1: int,
+                 block_size: int = 16, output_path: Optional[str] = None) -> str:
+    """Apply a mosaic (pixelation) effect to a rectangular region defined by bounding box coordinates.
+    This is typically used for anonymization, e.g. masking faces, license
+    plates, or other sensitive areas while leaving the rest of the image
+    unchanged.
+    Args:
+        file_path: Path to the source image file.
+        x0: X-coordinate of the top-left corner (pixels).
+        y0: Y-coordinate of the top-left corner (pixels).
+        x1: X-coordinate of the bottom-right corner (pixels).
+        y1: Y-coordinate of the bottom-right corner (pixels).
+        block_size: Size of mosaic blocks. Larger values produce coarser
+            pixelation. Must be a positive integer.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_mosaic_x0_y0_x1_y1<ext>" will be
+            created next to the source image.
+    Returns:
+        A human-readable message describing where the mosaic image is saved,
+        or an error message if the region is out of bounds or parameters are
+        invalid.
+    """
+    try:
+        image = image_manager.load_image(file_path)
+        # Ensure correct coordinates
+        x_min, x_max = min(x0, x1), max(x0, x1)
+        y_min, y_max = min(y0, y1), max(y0, y1)
+        width = x_max - x_min
+        height = y_max - y_min
+        img_width, img_height = image.size
+        if x_min < 0 or y_min < 0 or x_max > img_width or y_max > img_height:
+            return f"Mosaic region exceeds image boundaries. Image size: {img_width}x{img_height}"
+        if block_size <= 0:
+            return "block_size must be a positive integer"
+        # Extract region to pixelate
+        region = image.crop((x_min, y_min, x_max, y_max))
+        
+        # Compute downscaled size for pixelation (at least 1x1)
+        small_w = max(1, width // block_size)
+        small_h = max(1, height // block_size)
+        # Downscale then upscale using NEAREST to create mosaic blocks
+        mosaic_small = region.resize((small_w, small_h), Image.Resampling.NEAREST)
+        mosaic_region = mosaic_small.resize((width, height), Image.Resampling.NEAREST)
+        # Paste back into original image
+        image.paste(mosaic_region, (x_min, y_min))
+        # Save result
+        if not output_path:
+            name, ext = os.path.splitext(file_path)
+            output_path = f"{name}_mosaic_{x_min}_{y_min}_{x_max}_{y_max}{ext}"
+        image.save(output_path)
+        return f"Mosaic applied to region and saved to: {output_path}"
+    except Exception as e:
+        raise ImageProcessingError(f"Error applying mosaic: {str(e)}")
 
 @mcp.tool()
 def rotate_image(file_path: str, angle: float, expand: bool = True, output_path: Optional[str] = None) -> str:
-    """Rotate image by specified angle"""
+    """Rotate the image by a specified angle.
+
+    Args:
+        file_path: Path to the source image file.
+        angle: Rotation angle in degrees. Positive values rotate counter-
+            clockwise; negative values rotate clockwise.
+        expand: Whether to expand the canvas to fit the entire rotated image.
+            If False, parts of the image may be cropped.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_rotated_<angle>deg<ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the rotated image is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -178,7 +304,24 @@ def rotate_image(file_path: str, angle: float, expand: bool = True, output_path:
 @mcp.tool()
 def resize_image(file_path: str, width: int, height: int, maintain_aspect: bool = True, 
                 resample: str = "LANCZOS", output_path: Optional[str] = None) -> str:
-    """Resize image to specified dimensions"""
+    """Resize the image to the specified dimensions.
+
+    Args:
+        file_path: Path to the source image file.
+        width: Target width in pixels.
+        height: Target height in pixels.
+        maintain_aspect: If True, preserve the original aspect ratio. The
+            resulting image will fit within (width, height). If False, the
+            image is stretched exactly to (width, height).
+        resample: Resampling method to use. One of
+            "LANCZOS", "BILINEAR", "BICUBIC", "NEAREST".
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_resized_<width>x<height><ext>" will be
+            created.
+
+    Returns:
+        A human-readable message describing where the resized image is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -212,7 +355,19 @@ def resize_image(file_path: str, width: int, height: int, maintain_aspect: bool 
 
 @mcp.tool()
 def adjust_contrast(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
-    """Adjust image contrast (1.0 = original, >1 = enhance, <1 = reduce)"""
+    """Adjust the global contrast of an image.
+
+    Args:
+        file_path: Path to the source image file.
+        factor: Contrast factor. 1.0 keeps the original contrast; values
+            greater than 1.0 increase contrast; values between 0 and 1.0
+            reduce contrast.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_contrast_<factor><ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the adjusted image is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -233,7 +388,19 @@ def adjust_contrast(file_path: str, factor: float, output_path: Optional[str] = 
 
 @mcp.tool()
 def adjust_brightness(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
-    """Adjust image brightness (1.0 = original, >1 = brighter, <1 = darker)"""
+    """Adjust the global brightness of an image.
+
+    Args:
+        file_path: Path to the source image file.
+        factor: Brightness factor. 1.0 keeps original brightness; values
+            greater than 1.0 make the image brighter; values between 0 and
+            1.0 make it darker.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_brightness_<factor><ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the adjusted image is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -254,7 +421,19 @@ def adjust_brightness(file_path: str, factor: float, output_path: Optional[str] 
 
 @mcp.tool()
 def adjust_saturation(file_path: str, factor: float, output_path: Optional[str] = None) -> str:
-    """Adjust image saturation (1.0 = original, >1 = enhance, <1 = reduce, 0 = grayscale)"""
+    """Adjust the color saturation of an image.
+
+    Args:
+        file_path: Path to the source image file.
+        factor: Saturation factor. 1.0 keeps original colors; values greater
+            than 1.0 make colors more vivid; values between 0 and 1.0 reduce
+            saturation; 0 turns the image grayscale.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_saturation_<factor><ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the adjusted image is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -275,7 +454,24 @@ def adjust_saturation(file_path: str, factor: float, output_path: Optional[str] 
 
 @mcp.tool()
 def apply_filter(file_path: str, filter_type: str, output_path: Optional[str] = None) -> str:
-    """Apply image filter (BLUR, DETAIL, EDGE_ENHANCE, EDGE_ENHANCE_MORE, EMBOSS, FIND_EDGES, SHARPEN, SMOOTH, SMOOTH_MORE)"""
+    """Apply a built-in Pillow filter to the image.
+
+    Supported filter types include:
+    BLUR, DETAIL, EDGE_ENHANCE, EDGE_ENHANCE_MORE, EMBOSS,
+    FIND_EDGES, SHARPEN, SMOOTH, SMOOTH_MORE.
+
+    Args:
+        file_path: Path to the source image file.
+        filter_type: Name of the filter to apply (case-sensitive, must be one
+            of the supported filter names).
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_<filter_type.lower()><ext>" will be
+            created.
+
+    Returns:
+        A human-readable message describing where the filtered image is saved,
+        or an error message if the filter type is unknown.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -312,7 +508,19 @@ def apply_filter(file_path: str, filter_type: str, output_path: Optional[str] = 
 
 @mcp.tool()
 def flip_image(file_path: str, direction: str, output_path: Optional[str] = None) -> str:
-    """Flip image horizontally or vertically"""
+    """Flip the image horizontally or vertically.
+
+    Args:
+        file_path: Path to the source image file.
+        direction: Flip direction. Use "horizontal" for a left-right mirror
+            flip, or "vertical" for a top-bottom flip.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_flip_<direction><ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the flipped image is saved,
+        or an error message if the direction is invalid.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -337,7 +545,19 @@ def flip_image(file_path: str, direction: str, output_path: Optional[str] = None
 
 @mcp.tool()
 def convert_format(file_path: str, format: str, quality: int = 95, output_path: Optional[str] = None) -> str:
-    """Convert image format (JPEG, PNG, BMP, TIFF, WEBP)"""
+    """Convert the image to a different file format.
+
+    Args:
+        file_path: Path to the source image file.
+        format: Target format name (e.g. "JPEG", "PNG", "BMP", "TIFF", "WEBP").
+        quality: JPEG quality setting (1-100). Ignored for non-JPEG formats.
+        output_path: Optional path for the output image. If not provided,
+            a new file will be created next to the source image with the
+            appropriate extension.
+
+    Returns:
+        A human-readable message describing the new format and output path.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -363,7 +583,19 @@ def convert_format(file_path: str, format: str, quality: int = 95, output_path: 
 
 @mcp.tool()
 def get_image_info(file_path: str) -> str:
-    """Get image information and metadata"""
+    """Return human-readable information and metadata for an image.
+
+    The returned string includes basic properties (format, mode, width,
+    height, file size) and, when available, EXIF metadata such as camera
+    model, capture time, and other embedded fields.
+
+    Args:
+        file_path: Path to the image file.
+
+    Returns:
+        A formatted multi-line string describing image properties and EXIF
+        metadata, or an error message if the image cannot be read.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -407,7 +639,20 @@ def get_image_info(file_path: str) -> str:
 
 @mcp.tool()
 def create_thumbnail(file_path: str, size: int = 128, output_path: Optional[str] = None) -> str:
-    """Create image thumbnail"""
+    """Create a thumbnail image with the longest side limited to a given size.
+
+    The thumbnail preserves aspect ratio and is suitable for previews,
+    gallery views, or low-resolution representations.
+
+    Args:
+        file_path: Path to the source image file.
+        size: Maximum size (in pixels) of the longer edge of the thumbnail.
+        output_path: Optional path for the thumbnail image. If not provided,
+            a file named "<original>_thumbnail_<size><ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the thumbnail is saved.
+    """
     try:
         image = image_manager.load_image(file_path)
         
@@ -426,12 +671,34 @@ def create_thumbnail(file_path: str, size: int = 128, output_path: Optional[str]
         raise ImageProcessingError(f"Error creating thumbnail: {str(e)}")
 
 @mcp.tool()
-def add_watermark(file_path: str, watermark_text: str, position: str = "bottom-right", 
-                 opacity: float = 0.5, font_size: int = 36, output_path: Optional[str] = None) -> str:
-    """Add watermark to image"""
+def add_watermark(file_path: str, watermark_text: str, x: int, y: int,
+                 opacity: float = 0.5, font_size: int = 20, output_path: Optional[str] = None,
+                 text_color: tuple = (0, 0, 255)) -> str:
+    """Add a semi-transparent text watermark to an image.
+
+    The watermark is drawn on a transparent overlay and then composited with
+    the original image. This is typically used for branding or copyright
+    marking.
+
+    Args:
+        file_path: Path to the source image file.
+        watermark_text: Text content of the watermark.
+        x: Normalized x coordinate for watermark position (0-1000).
+        y: Normalized y coordinate for watermark position (0-1000).
+        opacity: Watermark opacity in the range [0.0, 1.0].
+        font_size: Font size of the watermark text.
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_watermarked<ext>" will be created.
+        text_color: RGB tuple for text color (default: blue (0, 0, 255)).
+
+    Returns:
+        A human-readable message describing where the watermarked image is
+        saved.
+    """
     try:
         image = image_manager.load_image(file_path)
-        
+        img_width, img_height = image.size
+
         # Create watermark layer
         watermark = Image.new('RGBA', image.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(watermark)
@@ -445,29 +712,43 @@ def add_watermark(file_path: str, watermark_text: str, position: str = "bottom-r
                 # Try other common fonts
                 font = ImageFont.truetype("C:/Windows/Fonts/simhei.ttf", font_size)
             except:
-                # Use default font
-                font = ImageFont.load_default()
+                # Try Linux system fonts (prioritize DejaVuSans)
+                linux_fonts = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+                    "/usr/share/fonts/truetype/droid/DroidSans.ttf",
+                ]
+                font_loaded = False
+                for font_path in linux_fonts:
+                    try:
+                        font = ImageFont.truetype(font_path, font_size)
+                        font_loaded = True
+                        break
+                    except:
+                        continue
+                
+                # Use default font as last resort
+                if not font_loaded:
+                    font = ImageFont.load_default()
         
         # Get text dimensions
         bbox = draw.textbbox((0, 0), watermark_text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         
-        # Calculate position
-        margin = 20
-        positions = {
-            "top-left": (margin, margin),
-            "top-right": (image.size[0] - text_width - margin, margin),
-            "bottom-left": (margin, image.size[1] - text_height - margin),
-            "bottom-right": (image.size[0] - text_width - margin, image.size[1] - text_height - margin),
-            "center": ((image.size[0] - text_width) // 2, (image.size[1] - text_height) // 2),
-        }
+        # Convert normalized coordinates (0-1000) to absolute pixels
+        # Formula: pixel = (normalized / 1000) * dimension
+        watermark_x = int((x / 1000) * img_width)
+        watermark_y = int((y / 1000) * img_height)
         
-        pos = positions.get(position, positions["bottom-right"])
+        # Validate coordinates
+        if watermark_x < 0 or watermark_y < 0 or watermark_x > img_width or watermark_y > img_height:
+            return f"Watermark position exceeds image boundaries. Image size: {img_width}x{img_height}, Position: [{watermark_x}, {watermark_y}]"
         
         # Draw watermark
         alpha = int(255 * opacity)
-        draw.text(pos, watermark_text, font=font, fill=(255, 255, 255, alpha))
+        draw.text((watermark_x, watermark_y), watermark_text, font=font, fill=(*text_color, alpha))
         
         # Merge images
         watermarked = Image.alpha_composite(image.convert('RGBA'), watermark)
@@ -483,6 +764,350 @@ def add_watermark(file_path: str, watermark_text: str, position: str = "bottom-r
         
     except Exception as e:
         raise ImageProcessingError(f"Error adding watermark: {str(e)}")
+
+@mcp.tool()
+def pptx_to_images(pptx_path: str, output_dir: Optional[str] = None) -> str:
+    """Convert a PowerPoint (.pptx) file to images.
+
+    Each slide in the presentation will be converted to a separate PNG image.
+
+    Args:
+        pptx_path: Path to the source PowerPoint file (.pptx).
+        output_dir: Optional directory for output images. If not provided,
+            a directory named "<pptx_name>_images" will be created next to
+            the source file.
+
+    Returns:
+        A human-readable message listing the converted image paths,
+        or an error message if conversion fails.
+    """
+    try:
+        # Generate output directory if not provided
+        if not output_dir:
+            base_name = os.path.splitext(pptx_path)[0]
+            output_dir = f"{base_name}_images"
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Initialize converter and convert
+        converter = PPTXToImageConverter(pptx_path, output_dir=output_dir)
+        images = converter.convert()
+        
+        return f"Converted {len(images)} slides to images in: {output_dir}\nImages: {images}"
+        
+    except Exception as e:
+        raise ImageProcessingError(f"Error converting PPTX to images: {str(e)}")
+
+
+@mcp.tool()
+def convert_pdf_to_images(
+    pdf_path: str,
+    output_dir: str,
+    pages: Optional[Union[int, List[int], tuple]] = None,
+    dpi: int = 100,
+    image_format: str = 'PNG',
+    prefix: str = 'page'
+) -> str:
+    """Convert specified PDF pages or page ranges to images.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        output_dir: Directory path for output images.
+        pages: Page range specification:
+            - int: Single page number (0-based)
+            - List[int]: List of page numbers [0, 2, 4]
+            - tuple: Page range (start_page, end_page) inclusive
+            - None: All pages
+        dpi: Image resolution, default 100
+        image_format: Image format, supports 'PNG', 'JPEG', 'BMP' etc., default 'PNG'
+        prefix: Output filename prefix, default 'page'
+
+    Returns:
+        A human-readable message listing the generated image file paths,
+        or an error message if conversion fails.
+    """
+    if fitz is None:
+        raise ImageProcessingError("PyMuPDF not installed. Please install PyMuPDF to use PDF conversion functionality.")
+    
+    try:
+        # Check if PDF file exists
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Open PDF file
+        pdf_document = fitz.open(pdf_path)
+        total_pages = pdf_document.page_count
+        
+        # Determine pages to convert
+        page_indices = []
+        
+        if pages is None:
+            # Convert all pages
+            page_indices = list(range(total_pages))
+        elif isinstance(pages, int):
+            # Single page
+            if 0 <= pages < total_pages:
+                page_indices = [pages]
+            else:
+                raise ValueError(f"Page {pages} out of range, PDF total pages: {total_pages}")
+        elif isinstance(pages, list):
+            # List of pages
+            for page_num in pages:
+                if 0 <= page_num < total_pages:
+                    page_indices.append(page_num)
+                else:
+                    raise ValueError(f"Page {page_num} out of range, PDF total pages: {total_pages}")
+        elif isinstance(pages, tuple) and len(pages) == 2:
+            # Page range
+            start_page, end_page = pages
+            if 0 <= start_page < total_pages and 0 <= end_page < total_pages:
+                page_indices = list(range(start_page, end_page + 1))
+            else:
+                raise ValueError(f"Page range ({start_page}, {end_page}) out of range, PDF total pages: {total_pages}")
+        else:
+            raise ValueError("pages parameter must be int, List[int], tuple, or None")
+        
+        # Convert specified pages
+        output_files = []
+        
+        for page_num in page_indices:
+            # Get page
+            page = pdf_document[page_num]
+            
+            # Set zoom factor to control resolution
+            zoom = dpi / 72.0  # PDF default DPI is 72
+            matrix = fitz.Matrix(zoom, zoom)
+            
+            # Render page to image
+            pix = page.get_pixmap(matrix=matrix)
+            
+            # Convert to PIL Image
+            img_data = pix.tobytes(image_format.lower())
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Generate output filename
+            output_filename = f"{prefix}_{page_num + 1}.{image_format.lower()}"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            # Save image
+            img.save(output_path, format=image_format)
+            output_files.append(output_path)
+            
+            print(f"Converted page {page_num + 1}: {output_path}")
+        
+        # Close PDF document
+        pdf_document.close()
+        
+        return f"Successfully converted {len(output_files)} pages to images in: {output_dir}\nImages: {output_files}"
+        
+    except Exception as e:
+        if 'pdf_document' in locals():
+            pdf_document.close()
+        raise ImageProcessingError(f"PDF conversion failed: {str(e)}")
+
+
+@mcp.tool()
+def word_to_images(docx_path: str, output_dir: Optional[str] = None) -> str:
+    """Convert a Word document (.docx) to images.
+
+    The document is first converted to PDF using LibreOffice, then each page
+    is converted to a separate PNG image. Requires LibreOffice (soffice) to
+    be installed on the system.
+
+    Args:
+        docx_path: Path to the source Word document (.docx).
+        output_dir: Optional directory for output images. If not provided,
+            a directory named "<docx_name>_images" will be created next to
+            the source file.
+
+    Returns:
+        A human-readable message listing the converted image paths,
+        or an error message if conversion fails.
+    """
+    try:
+        # Generate output directory if not provided
+        if not output_dir:
+            base_name = os.path.splitext(docx_path)[0]
+            output_dir = f"{base_name}_images"
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert docx to pdf using LibreOffice
+        subprocess.run([
+            "soffice", "--headless", "--convert-to", "pdf",
+            "--outdir", output_dir, docx_path
+        ], check=True)
+        
+        # Get the generated pdf file path
+        base_name = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+        
+        # Convert pdf to images
+        images = convert_from_path(pdf_path)
+        
+        image_paths = []
+        for i, image in enumerate(images):
+            img_path = os.path.join(output_dir, f"{base_name}_page_{i+1}.png")
+            image.save(img_path, "PNG")
+            image_paths.append(img_path)
+        
+        # Clean up temporary pdf
+        os.remove(pdf_path)
+        
+        return f"Converted {len(image_paths)} pages to images in: {output_dir}\nImages: {image_paths}"
+        
+    except subprocess.CalledProcessError as e:
+        raise ImageProcessingError(f"LibreOffice conversion failed: {str(e)}. Make sure LibreOffice is installed.")
+    except Exception as e:
+        raise ImageProcessingError(f"Error converting Word to images: {str(e)}")
+
+
+@mcp.tool()
+def get_video_metadata_json(video_path: str) -> str:
+    """Return JSON metadata (duration, frame size, FPS, approximate frames) for a video file."""
+    try:
+        path = _ensure_video_path(video_path)
+        with VideoFileClip(str(path)) as clip:
+            fps = clip.fps or 0
+            approx_total_frames = int(round(fps * clip.duration)) if fps else None
+            data = {
+                "duration_seconds": round(clip.duration, 2),
+                "frame_size": clip.size,
+                "fps": round(fps, 2),
+                "approx_total_frames": approx_total_frames,
+            }
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ImageProcessingError(f"Error reading video metadata: {str(e)}")
+
+
+@mcp.tool()
+def export_frames_every_second(
+    video_path: str,
+    output_dir: str,
+    interval_seconds: int = 1,
+) -> str:
+    """Capture one frame every `interval_seconds` seconds across the video and store them under `output_dir`."""
+    try:
+        if interval_seconds <= 0:
+            raise ImageProcessingError("interval_seconds must be positive.")
+
+        path = _ensure_video_path(video_path)
+        output_path = Path(output_dir)
+        exported_files: List[str] = []
+
+        with VideoFileClip(str(path)) as clip:
+            duration = math.floor(clip.duration)
+            output_path.mkdir(parents=True, exist_ok=True)
+            for second in range(0, duration, interval_seconds):
+                frame = clip.get_frame(second)
+                frame_path = output_path / f"sec_{second:04d}.jpg"
+                _save_frame_to_path(frame, frame_path)
+                exported_files.append(str(frame_path.resolve()))
+
+        result = {
+            "exported_count": len(exported_files),
+            "output_directory": str(output_path.resolve()),
+            "frames": exported_files,
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ImageProcessingError(f"Error exporting per-second frames: {str(e)}")
+
+
+@mcp.tool()
+def export_frames_for_second(
+    video_path: str,
+    target_second: int,
+    output_dir: str,
+) -> str:
+    """Export all frames within [target_second, target_second + 1) to `output_dir` for burst analysis."""
+    try:
+        path = _ensure_video_path(video_path)
+        output_path = Path(output_dir)
+        exported_files: List[str] = []
+
+        with VideoFileClip(str(path)) as clip:
+            fps = clip.fps or 0
+            if fps <= 0:
+                raise ImageProcessingError("Video FPS is unavailable; cannot sample frames.")
+            if target_second < 0 or target_second >= clip.duration:
+                raise ImageProcessingError("target_second is outside the video duration.")
+
+            interval_duration = min(1.0, clip.duration - target_second)
+            max_frames = max(1, math.floor(interval_duration * fps))
+
+            output_path.mkdir(parents=True, exist_ok=True)
+            for frame_idx in range(max_frames):
+                frame_timestamp = target_second + frame_idx / fps
+                frame = clip.get_frame(frame_timestamp)
+                frame_path = output_path / f"sec_{target_second:04d}_frame_{frame_idx:04d}.jpg"
+                _save_frame_to_path(frame, frame_path)
+                exported_files.append(str(frame_path.resolve()))
+
+        result = {
+            "second": target_second,
+            "exported_count": len(exported_files),
+            "frames": exported_files,
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ImageProcessingError(f"Error exporting frames for second {target_second}: {str(e)}")
+
+
+@mcp.tool()
+def export_frame_at_second(
+    video_path: str,
+    second: int,
+    output_path: str,
+) -> str:
+    """Save the frame located exactly at `second` to `output_path` and return the saved path."""
+    try:
+        path = _ensure_video_path(video_path)
+        target_path = Path(output_path)
+        with VideoFileClip(str(path)) as clip:
+            if second < 0 or second >= clip.duration:
+                raise ImageProcessingError("second is outside the video duration.")
+            frame = clip.get_frame(second)
+            _save_frame_to_path(frame, target_path)
+        return str(target_path.resolve())
+    except Exception as e:
+        raise ImageProcessingError(f"Error exporting frame at second {second}: {str(e)}")
+
+
+@mcp.tool()
+def export_frame_by_index(
+    video_path: str,
+    frame_index: int,
+    output_path: str,
+) -> str:
+    """Save the frame referenced by absolute `frame_index` (0-based) to `output_path`."""
+    try:
+        if frame_index < 0:
+            raise ImageProcessingError("frame_index must be non-negative.")
+
+        path = _ensure_video_path(video_path)
+        target_path = Path(output_path)
+
+        with VideoFileClip(str(path)) as clip:
+            fps = clip.fps or 0
+            if fps <= 0:
+                raise ImageProcessingError("Video FPS is unavailable; cannot sample by frame index.")
+            total_frames = int(clip.duration * fps)
+            if frame_index >= total_frames:
+                raise ImageProcessingError(f"frame_index must be < {total_frames}.")
+
+            frame_timestamp = frame_index / fps
+            frame = clip.get_frame(frame_timestamp)
+            _save_frame_to_path(frame, target_path)
+
+        return str(target_path.resolve())
+    except Exception as e:
+        raise ImageProcessingError(f"Error exporting frame #{frame_index}: {str(e)}")
+
 
 if __name__ == "__main__":
     mcp.run()
