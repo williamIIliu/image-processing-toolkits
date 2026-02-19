@@ -10,13 +10,14 @@ This server provides comprehensive media processing capabilities including:
 - Metadata extraction
 - Thumbnail generation
 - Watermark addition
-- file2image utilities: convert WORD and PPTX to images
+- file2image utilities: convert WORD, PPTX, and EXCEL to images
 - Video utilities: metadata inspection, per-second frame sampling, per-second burst capture,
   single-second snapshots, and frame-by-index exports
 
 The server uses PIL (Pillow) for image processing and includes memory management
 and caching for efficient operation.
 """
+
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
 import os
@@ -24,21 +25,25 @@ import subprocess
 import threading
 import time
 import psutil
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
+import tempfile
+import shutil
+import io
+import json
+import math
+from pathlib import Path
+
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont, ImageChops
 from PIL.ExifTags import TAGS
 from mcp.server.fastmcp import FastMCP
 from pptxtoimages.tools import PPTXToImageConverter
 from pdf2image import convert_from_path
 import fitz 
-import io
-
-
-import json
-import math
-from pathlib import Path
 import imageio
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
+# Try to import openpyxl
+import openpyxl
+from openpyxl.utils import get_column_letter
 
 def _ensure_video_path(video_path: str) -> Path:
     """Validate the incoming video path and return it as a Path object."""
@@ -47,11 +52,9 @@ def _ensure_video_path(video_path: str) -> Path:
         raise ImageProcessingError(f"Video not found at: {video_path}")
     return path
 
-
 def _save_frame_to_path(frame, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(output_path, frame)
-
 
 class ImageProcessorError(Exception):
     """Base class for image processing related errors"""
@@ -212,7 +215,7 @@ def crop_image(file_path: str, ymin: int, xmin: int, ymax: int, xmax: int, outpu
         
     except Exception as e:
         raise ImageProcessingError(f"Error cropping image: {str(e)}")
-        
+
 @mcp.tool()
 def apply_mosaic(file_path: str, x0: int, y0: int, x1: int, y1: int,
                  block_size: int = 16, output_path: Optional[str] = None) -> str:
@@ -220,6 +223,7 @@ def apply_mosaic(file_path: str, x0: int, y0: int, x1: int, y1: int,
     This is typically used for anonymization, e.g. masking faces, license
     plates, or other sensitive areas while leaving the rest of the image
     unchanged.
+
     Args:
         file_path: Path to the source image file.
         x0: X-coordinate of the top-left corner (pixels).
@@ -231,6 +235,7 @@ def apply_mosaic(file_path: str, x0: int, y0: int, x1: int, y1: int,
         output_path: Optional path for the output image. If not provided,
             a file named "<original>_mosaic_x0_y0_x1_y1<ext>" will be
             created next to the source image.
+
     Returns:
         A human-readable message describing where the mosaic image is saved,
         or an error message if the region is out of bounds or parameters are
@@ -244,27 +249,35 @@ def apply_mosaic(file_path: str, x0: int, y0: int, x1: int, y1: int,
         width = x_max - x_min
         height = y_max - y_min
         img_width, img_height = image.size
+
         if x_min < 0 or y_min < 0 or x_max > img_width or y_max > img_height:
             return f"Mosaic region exceeds image boundaries. Image size: {img_width}x{img_height}"
+
         if block_size <= 0:
             return "block_size must be a positive integer"
+
         # Extract region to pixelate
         region = image.crop((x_min, y_min, x_max, y_max))
         
         # Compute downscaled size for pixelation (at least 1x1)
         small_w = max(1, width // block_size)
         small_h = max(1, height // block_size)
+
         # Downscale then upscale using NEAREST to create mosaic blocks
         mosaic_small = region.resize((small_w, small_h), Image.Resampling.NEAREST)
         mosaic_region = mosaic_small.resize((width, height), Image.Resampling.NEAREST)
+
         # Paste back into original image
         image.paste(mosaic_region, (x_min, y_min))
+
         # Save result
         if not output_path:
             name, ext = os.path.splitext(file_path)
             output_path = f"{name}_mosaic_{x_min}_{y_min}_{x_max}_{y_max}{ext}"
+        
         image.save(output_path)
         return f"Mosaic applied to region and saved to: {output_path}"
+
     except Exception as e:
         raise ImageProcessingError(f"Error applying mosaic: {str(e)}")
 
@@ -671,84 +684,106 @@ def create_thumbnail(file_path: str, size: int = 128, output_path: Optional[str]
         raise ImageProcessingError(f"Error creating thumbnail: {str(e)}")
 
 @mcp.tool()
-def add_watermark(file_path: str, watermark_text: str, x: int, y: int,
-                 opacity: float = 0.5, font_size: int = 20, output_path: Optional[str] = None,
-                 text_color: tuple = (0, 0, 255)) -> str:
-    """Add a semi-transparent text watermark to an image.
+def add_text_to_photo(file_path: str, watermark_text: str, ymin: int, xmin: int,
+                 color: str = "white", font_size: int = 36, opacity: float = 0.5, output_path: Optional[str] = None) -> str:
+    """Add semi-transparent text to an image using coordinate placement.
 
-    The watermark is drawn on a transparent overlay and then composited with
-    the original image. This is typically used for branding or copyright
-    marking.
+    The text is drawn on a transparent overlay and then composited with the
+    original image.
 
     Args:
         file_path: Path to the source image file.
-        watermark_text: Text content of the watermark.
-        x: Normalized x coordinate for watermark position (0-1000).
-        y: Normalized y coordinate for watermark position (0-1000).
-        opacity: Watermark opacity in the range [0.0, 1.0].
-        font_size: Font size of the watermark text.
+        watermark_text: Text to render.
+        ymin: Normalized Y coordinate (0-1000) of the text anchor.
+        xmin: Normalized X coordinate (0-1000) of the text anchor.
+        color: Text color (named or hex). Named colors supported: "white",
+               "black", "red", "green", "blue", "yellow", "cyan", "magenta".
+               Hex format "#RRGGBB" is also supported.
+        font_size: Font size in pixels.
+        opacity: Opacity in [0.0, 1.0].
         output_path: Optional path for the output image. If not provided,
             a file named "<original>_watermarked<ext>" will be created.
-        text_color: RGB tuple for text color (default: blue (0, 0, 255)).
+
+    Notes:
+        - Anchor: the provided (ymin, xmin) refers to the TOP-LEFT corner of the text.
 
     Returns:
-        A human-readable message describing where the watermarked image is
-        saved.
+        A human-readable message describing where the watermarked image is saved.
     """
     try:
+        
         image = image_manager.load_image(file_path)
         img_width, img_height = image.size
-
+        
         # Create watermark layer
         watermark = Image.new('RGBA', image.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(watermark)
         
-        # Try to load font
-        try:
-            # Try to use system font on Windows
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except:
+        # Try to load font from common Linux and Windows paths
+        font = None
+        candidate_fonts = [
+            # Linux common
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            # Windows common
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/msyh.ttc",
+        ]
+        for fp in candidate_fonts:
             try:
-                # Try other common fonts
-                font = ImageFont.truetype("C:/Windows/Fonts/simhei.ttf", font_size)
-            except:
-                # Try Linux system fonts (prioritize DejaVuSans)
-                linux_fonts = [
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-                    "/usr/share/fonts/truetype/droid/DroidSans.ttf",
-                ]
-                font_loaded = False
-                for font_path in linux_fonts:
-                    try:
-                        font = ImageFont.truetype(font_path, font_size)
-                        font_loaded = True
-                        break
-                    except:
-                        continue
-                
-                # Use default font as last resort
-                if not font_loaded:
-                    font = ImageFont.load_default()
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except Exception:
+                font = ImageFont.load_default()
         
         # Get text dimensions
         bbox = draw.textbbox((0, 0), watermark_text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         
-        # Convert normalized coordinates (0-1000) to absolute pixels
-        # Formula: pixel = (normalized / 1000) * dimension
-        watermark_x = int((x / 1000) * img_width)
-        watermark_y = int((y / 1000) * img_height)
+        # Calculate position from normalized coordinates (0-1000)
+        x = int((xmin / 1000) * img_width)
+        y = int((ymin / 1000) * img_height)
         
-        # Validate coordinates
-        if watermark_x < 0 or watermark_y < 0 or watermark_x > img_width or watermark_y > img_height:
-            return f"Watermark position exceeds image boundaries. Image size: {img_width}x{img_height}, Position: [{watermark_x}, {watermark_y}]"
+        # Simple color parser (named colors and #RRGGBB)
+        def _parse_color(c: str) -> tuple:
+            named = {
+                "white": (255, 255, 255),
+                "black": (0, 0, 0),
+                "red": (255, 0, 0),
+                "green": (0, 255, 0),
+                "blue": (0, 0, 255),
+                "yellow": (255, 255, 0),
+                "cyan": (0, 255, 255),
+                "magenta": (255, 0, 255),
+            }
+            c = c.lower().strip()
+            if c in named:
+                return named[c]
+            if c.startswith('#') and len(c) == 7:
+                try:
+                    r = int(c[1:3], 16)
+                    g = int(c[3:5], 16)
+                    b = int(c[5:7], 16)
+                    return (r, g, b)
+                except Exception:
+                    return named["white"]
+            return named["white"]
         
         # Draw watermark
-        alpha = int(255 * opacity)
-        draw.text((watermark_x, watermark_y), watermark_text, font=font, fill=(*text_color, alpha))
+        alpha = int(255 * max(0.0, min(1.0, opacity)))
+        r, g, b = _parse_color(color)
+        draw.text((x, y), watermark_text, font=font, fill=(r, g, b, alpha))
         
         # Merge images
         watermarked = Image.alpha_composite(image.convert('RGBA'), watermark)
@@ -764,6 +799,152 @@ def add_watermark(file_path: str, watermark_text: str, x: int, y: int,
         
     except Exception as e:
         raise ImageProcessingError(f"Error adding watermark: {str(e)}")
+
+@mcp.tool()
+def overlay_image_on_photo(
+    base_image_path: str,
+    overlay_image_path: str,
+    ymin: int,
+    xmin: int,
+    scale: float = 1.0,
+    output_path: Optional[str] = None
+) -> str:
+    """Paste an overlay image onto a base image using coordinate placement.
+
+    The overlay is pasted preserving its alpha channel, with its TOP-LEFT
+    corner aligned to the specified (ymin, xmin) position.
+
+    Args:
+        base_image_path: Path to the base image.
+        overlay_image_path: Path to the overlay image (PNG with transparency recommended).
+        ymin: Normalized Y coordinate (0-1000) for the overlay's top-left corner.
+        xmin: Normalized X coordinate (0-1000) for the overlay's top-left corner.
+        scale: Scale factor applied to the overlay image size (e.g., 0.5 halves the size).
+        output_path: Optional path for the output image. If not provided, it will use
+            the base image name with an "_overlay" suffix.
+
+    Returns:
+        Success message with output path.
+    """
+    try:
+        # Load base image
+        base_img = Image.open(base_image_path).convert('RGBA')
+        width, height = base_img.size
+        
+        # Load overlay image
+        if not (overlay_image_path and os.path.exists(overlay_image_path)):
+            raise ImageProcessingError(f"Overlay image not found: {overlay_image_path}")
+        ov = Image.open(overlay_image_path).convert('RGBA')
+        
+        # Scale overlay image
+        if scale != 1.0:
+            new_w = max(1, int(ov.width * scale))
+            new_h = max(1, int(ov.height * scale))
+            ov = ov.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # Position from normalized coordinates (0-1000)
+        x = int((xmin / 1000) * width)
+        y = int((ymin / 1000) * height)
+        
+        # Paste overlay
+        base_img.paste(ov, (x, y), ov)
+        result = base_img
+        
+        # Convert back to RGB if needed
+        if result.mode == 'RGBA':
+            rgb_result = Image.new('RGB', result.size, (255, 255, 255))
+            rgb_result.paste(result, mask=result.split()[3])
+            result = rgb_result
+        
+        # Generate output path if not provided
+        if not output_path:
+            base_name, ext = os.path.splitext(base_image_path)
+            output_path = f"{base_name}_overlay{ext}"
+        
+        # Save result
+        result.save(output_path, quality=95)
+        return f"Successfully added image overlay. Saved to: {output_path}"
+        
+    except Exception as e:
+        raise ImageProcessingError(f"Error adding overlay: {str(e)}")
+        
+@mcp.tool()
+def draw_bounding_box_on_photo(image_path: str, ymin: int, xmin: int, ymax: int, xmax: int,
+                               color: str = "red", output_path: Optional[str] = None) -> str:
+    """Draw a rectangular bounding box on an image using normalized coordinates.
+
+    Args:
+        image_path: Path to the image.
+        ymin: Normalized top edge (0-1000).
+        xmin: Normalized left edge (0-1000).
+        ymax: Normalized bottom edge (0-1000).
+        xmax: Normalized right edge (0-1000).
+        color: Outline color (named or hex). Named colors supported: "white",
+               "black", "red", "green", "blue", "yellow", "cyan", "magenta".
+               Hex format "#RRGGBB" is also supported. Default is "red".
+        output_path: Optional path for the output image. If not provided,
+            a file named "<original>_boxed<ext>" will be created.
+
+    Returns:
+        A human-readable message describing where the boxed image is saved.
+    """
+    try:
+        image = image_manager.load_image(image_path)
+        width, height = image.size
+        
+        # Convert normalized coordinates (0-1000) to absolute pixels
+        x0 = int((xmin / 1000) * width)
+        y0 = int((ymin / 1000) * height)
+        x1 = int((xmax / 1000) * width)
+        y1 = int((ymax / 1000) * height)
+        
+        # Ensure correct order
+        x_min, x_max = min(x0, x1), max(x0, x1)
+        y_min, y_max = min(y0, y1), max(y0, y1)
+        
+        # Create overlay to draw the rectangle
+        overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        line_w = max(1, int(min(width, height) * 0.005))
+
+        # Parse color
+        def _parse_color(c: str) -> tuple:
+            named = {
+                "white": (255, 255, 255),
+                "black": (0, 0, 0),
+                "red": (255, 0, 0),
+                "green": (0, 255, 0),
+                "blue": (0, 0, 255),
+                "yellow": (255, 255, 0),
+                "cyan": (0, 255, 255),
+                "magenta": (255, 0, 255),
+            }
+            c = c.lower().strip()
+            if c in named:
+                return named[c]
+            if c.startswith('#') and len(c) == 7:
+                try:
+                    r = int(c[1:3], 16)
+                    g = int(c[3:5], 16)
+                    b = int(c[5:7], 16)
+                    return (r, g, b)
+                except Exception:
+                    return named["red"]
+            return named["red"]
+        r, g, b = _parse_color(color)
+
+        draw.rectangle([x_min, y_min, x_max, y_max], outline=(r, g, b, 255), width=line_w)
+        
+        # Composite and save
+        composed = Image.alpha_composite(image.convert('RGBA'), overlay)
+        result = composed.convert('RGB')
+        if not output_path:
+            name, ext = os.path.splitext(image_path)
+            output_path = f"{name}_boxed{ext}"
+        result.save(output_path)
+        return f"Bounding box drawn and saved to: {output_path}"
+    except Exception as e:
+        raise ImageProcessingError(f"Error drawing bounding box: {str(e)}")
 
 @mcp.tool()
 def pptx_to_images(pptx_path: str, output_dir: Optional[str] = None) -> str:
@@ -818,7 +999,6 @@ def convert_pdf_to_images(
             - List[int]: List of page numbers [0, 2, 4]
             - tuple: Page range (start_page, end_page) inclusive
             - None: All pages
-        dpi: Image resolution, default 100
         image_format: Image format, supports 'PNG', 'JPEG', 'BMP' etc., default 'PNG'
         prefix: Output filename prefix, default 'page'
 
@@ -964,6 +1144,142 @@ def word_to_images(docx_path: str, output_dir: Optional[str] = None) -> str:
     except Exception as e:
         raise ImageProcessingError(f"Error converting Word to images: {str(e)}")
 
+
+@mcp.tool()
+def excel_to_image(file_path: str, sheetname: str = "Sheet1", output_path: Optional[str] = None) -> str:
+    """Convert an Excel sheet to an image using LibreOffice.
+    
+    This tool converts a specific Excel sheet into a single image. It automatically adjusts 
+    the print area and page settings to ensure the entire content fits on one page (landscape),
+    preventing columns from being cut off.
+
+    Dependencies:
+        - LibreOffice (soffice command)
+        - pdf2image (and poppler-utils)
+        - openpyxl (recommended for best results)
+
+    Args:
+        file_path: Path to the Excel file (.xlsx, .xls).
+        sheetname: Name of the sheet to convert (default: "Sheet1"). 
+                   Note: Currently, due to LibreOffice limitations, this might convert the active sheet 
+                   or the first sheet if not specified strictly, but the tool attempts to configure the file correctly.
+        output_path: Optional path for the output image (e.g., "output.png"). 
+                     If not provided, the image will be saved in the same directory as the Excel file 
+                     with the same name and a .png extension.
+
+    Returns:
+        A human-readable string indicating success and the path to the saved image, 
+        or an error message if the operation fails.
+    """
+    abs_file_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_file_path):
+        raise ImageProcessingError(f"Input file not found: {abs_file_path}")
+
+    # Determine output path if not provided
+    if not output_path:
+        base_name = os.path.splitext(abs_file_path)[0]
+        output_path = f"{base_name}.png"
+
+    # Preprocessing helper
+    def preprocess_excel(path):
+        # Create a temp copy to avoid modifying original
+        fd, temp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        shutil.copy2(path, temp_path)
+        
+        try:
+            wb = openpyxl.load_workbook(temp_path)
+            for sheet in wb.worksheets:
+                sheet.print_area = None
+                
+                # Calculate the dimension
+                max_row = sheet.max_row
+                max_col = sheet.max_column
+                if max_row > 0 and max_col > 0:
+                    last_col_letter = get_column_letter(max_col)
+                    sheet.print_area = f"A1:{last_col_letter}{max_row}"
+                
+                # Page setup
+                sheet.page_setup.orientation = sheet.ORIENTATION_LANDSCAPE
+                sheet.page_setup.fitToPage = True
+                sheet.page_setup.fitToWidth = 1
+                sheet.page_setup.fitToHeight = 0 
+                
+                # Margins
+                sheet.page_margins.left = 0
+                sheet.page_margins.right = 0
+                sheet.page_margins.top = 0
+                sheet.page_margins.bottom = 0
+                sheet.page_margins.header = 0
+                sheet.page_margins.footer = 0
+                
+            wb.save(temp_path)
+            wb.close()
+            return temp_path, True
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return path, False
+
+    # Image trimming helper
+    def trim_whitespace(img):
+        bg = Image.new(img.mode, img.size, img.getpixel((0,0)))
+        diff = ImageChops.difference(img, bg)
+        diff = ImageChops.add(diff, diff, 2.0, -100)
+        bbox = diff.getbbox()
+        if bbox:
+            return img.crop(bbox)
+        return img
+
+    processed_path, is_temp = preprocess_excel(abs_file_path)
+    output_dir = tempfile.mkdtemp()
+    
+    # LibreOffice output filename guess
+    base_name = os.path.splitext(os.path.basename(processed_path))[0]
+    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+
+    try:
+        # LibreOffice conversion
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
+            "--outdir",
+            output_dir,
+            processed_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ImageProcessingError(f"LibreOffice conversion failed: {result.stderr}")
+
+        # Locate PDF
+        if not os.path.exists(pdf_path):
+            files = [f for f in os.listdir(output_dir) if f.endswith(".pdf")]
+            if files:
+                pdf_path = os.path.join(output_dir, files[0])
+            else:
+                raise ImageProcessingError("PDF file was not generated by LibreOffice.")
+
+        # PDF to Image
+        images = convert_from_path(pdf_path, dpi=100)
+        if images:
+            img = images[0]
+            img = trim_whitespace(img)
+            img.save(output_path)
+            return f"Excel sheet converted and saved to: {output_path}"
+        else:
+            raise ImageProcessingError("No images extracted from the generated PDF.")
+
+    except Exception as e:
+        raise ImageProcessingError(f"Error converting Excel to image: {str(e)}")
+        
+    finally:
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        if is_temp and os.path.exists(processed_path):
+            os.remove(processed_path)
 
 @mcp.tool()
 def get_video_metadata_json(video_path: str) -> str:
