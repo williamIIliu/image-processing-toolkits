@@ -11,4 +11,10 @@ dependencies = [
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
     "psutil>=5.9.0",
+    "pdf2image",
+    "PyMuPDF>=1.23.0",
+    "pptxtoimages",
+    "moviepy",
+    "openpyxl",
+    "psutil"
 ]
